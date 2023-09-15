@@ -36,11 +36,14 @@
 #include "port.h"
 #include "utils.h"
 
+#define MAX_GPIO_NAME_LEN	32 + 1
+
 extern FILE *diag;
 
 struct gpio_list {
 	struct gpio_list *next;
 	int gpio;
+	char gpio_name[MAX_GPIO_NAME_LEN]; // NUL terminated
 	int input; /* 1 if direction of gpio should be changed back to input. */
 	int exported; /* 0 if gpio should be unexported. */
 };
@@ -92,10 +95,10 @@ static int read_from(const char *filename, char *buf, size_t len)
 	return n;
 }
 
-static int drive_gpio(int n, int level, struct gpio_list **gpio_to_release)
+static int drive_gpio(int gpio_n, const char *gpio_name, int level, struct gpio_list **gpio_to_release)
 {
 	char num[16]; /* sized to carry MAX_INT */
-	char file[48]; /* sized to carry longest filename */
+	char file[26 + MAX_GPIO_NAME_LEN]; /* sized for longest filename "/sys/class/gpio/%s/direction" */
 	char dir;
 	struct stat buf;
 	struct gpio_list *new;
@@ -103,26 +106,37 @@ static int drive_gpio(int n, int level, struct gpio_list **gpio_to_release)
 	int exported = 1;
 	int input = 0;
 
-	sprintf(file, "/sys/class/gpio/gpio%d/value", n);
+	if (*gpio_name != '\0') {
+		sprintf(file, "/sys/class/gpio/%s/value", gpio_name);
+	} else {
+		sprintf(file, "/sys/class/gpio/gpio%d/value", gpio_n);
+	}
 	ret = stat(file, &buf);
-	if (ret) {
+	if (ret && *gpio_name == '\0') {
 		/* file miss, GPIO not exported yet */
-		sprintf(num, "%d", n);
+		sprintf(num, "%d", gpio_n);
 		ret = write_to("/sys/class/gpio/export", num);
 		if (!ret)
 			return 0;
 		ret = stat(file, &buf);
 		if (ret) {
-			fprintf(stderr, "GPIO %d not available\n", n);
+			fprintf(stderr, "GPIO %d not available\n", gpio_n);
 			return 0;
 		}
 		/* give udevd a chance to set permissions */
 		if (access(file, W_OK))
 			usleep(10);
 		exported = 0;
+	} else if (ret) {
+		fprintf(stderr, "Unavailable GPIO '%s' cannot be exported\n", gpio_name);
+		return 0;
 	}
 
-	sprintf(file, "/sys/class/gpio/gpio%d/direction", n);
+	if (*gpio_name != '\0') {
+		sprintf(file, "/sys/class/gpio/%s/direction", gpio_name);
+	} else {
+		sprintf(file, "/sys/class/gpio/gpio%d/direction", gpio_n);
+	}
 	ret = stat(file, &buf);
 	if (!ret)
 		if (read_from(file, &dir, sizeof(dir)))
@@ -135,7 +149,8 @@ static int drive_gpio(int n, int level, struct gpio_list **gpio_to_release)
 			fprintf(stderr, "Out of memory\n");
 			return 0;
 		}
-		new->gpio = n;
+		new->gpio = gpio_n;
+		strcpy(new->gpio_name, gpio_name);
 		new->exported = exported;
 		new->input = input;
 		new->next = *gpio_to_release;
@@ -145,29 +160,38 @@ static int drive_gpio(int n, int level, struct gpio_list **gpio_to_release)
 	return write_to(file, level ? "high" : "low");
 }
 
-static int release_gpio(int n, int input, int exported)
+static int release_gpio(int gpio_n, const char *gpio_name, int input, int exported)
 {
 	char num[16]; /* sized to carry MAX_INT */
 	char file[48]; /* sized to carry longest filename */
 
-	sprintf(num, "%d", n);
+	sprintf(num, "%d", gpio_n);
 	if (input) {
-		sprintf(file, "/sys/class/gpio/gpio%d/direction", n);
+		if (*gpio_name != '\0') {
+			sprintf(file, "/sys/class/gpio/%s/direction", gpio_name);
+		} else {
+			sprintf(file, "/sys/class/gpio/gpio%d/direction", gpio_n);
+		}
 		write_to(file, "in");
 	}
-	if (!exported)
+	if (!exported && *gpio_name == '\0')
 		write_to("/sys/class/gpio/unexport", num);
 
 	return 1;
 }
 #else
-static int drive_gpio(int __unused n, int __unused level,
+static int drive_gpio(int __unused gpio_n, const char __unused *gpio_name, int __unused level,
 		      struct gpio_list __unused **gpio_to_release)
 {
 	fprintf(stderr, "GPIO control only available in Linux\n");
 	return 0;
 }
 #endif
+
+static int is_delimiter(const char s)
+{
+	return ((s == ',') || (s == '&'));
+}
 
 static int gpio_sequence(struct port_interface *port, const char *seq, size_t len_seq)
 {
@@ -179,11 +203,14 @@ static int gpio_sequence(struct port_interface *port, const char *seq, size_t le
 	int sleep_time = 0;
 	int delimiter = 0;
 	const char *sig_str = NULL;
+	char gpio_name[MAX_GPIO_NAME_LEN]; // NUL terminated
 	const char *s = seq;
 	size_t l = len_seq;
 
 	fprintf(diag, "\nGPIO sequence start\n");
 	while (ret == 0 && *s && l > 0) {
+		gpio_name[0] = '\0';
+		gpio = 0;
 		sig_str = NULL;
 		sleep_time = 0;
 		delimiter = 0;
@@ -216,6 +243,20 @@ static int gpio_sequence(struct port_interface *port, const char *seq, size_t le
 			gpio = -GPIO_BRK;
 			s += 3;
 			l -= 3;
+		} else if (!is_delimiter(*s)) {
+			int i = 0;
+			do {
+				gpio_name[i++] = *s;
+				s++;
+				l--;
+			} while (!is_delimiter(*s) && (i < MAX_GPIO_NAME_LEN - 1) && (l > 0));
+			gpio_name[i] = '\0';
+
+			if (i == MAX_GPIO_NAME_LEN) {
+				fprintf(stderr, "Invalid sequence, GPIO name is too long\n");
+				ret = 1;
+				break;
+			}
 		} else if (*s && (l > 0)) {
 			delimiter = 1;
 			/* The ',' delimiter adds a 100 ms delay between signal toggles.
@@ -253,8 +294,12 @@ static int gpio_sequence(struct port_interface *port, const char *seq, size_t le
 				ret = (port->gpio(port, gpio, level) != PORT_ERR_OK);
 				printStatus(diag, ret);
 			} else {
-				fprintf(diag, " setting gpio %i to %i... ", gpio, level);
-				ret = (drive_gpio(gpio, level, &gpio_to_release) != 1);
+				if (*gpio_name != '\0') {
+					fprintf(diag, " setting gpio %s to %i... ", gpio_name, level);
+				} else {
+					fprintf(diag, " setting gpio %d to %i... ", gpio, level);
+				}
+				ret = (drive_gpio(gpio, gpio_name, level, &gpio_to_release) != 1);
 				printStatus(diag, ret);
 			}
 		}
@@ -266,7 +311,7 @@ static int gpio_sequence(struct port_interface *port, const char *seq, size_t le
 	}
 #if defined(__linux__)
 	while (gpio_to_release) {
-		release_gpio(gpio_to_release->gpio, gpio_to_release->input, gpio_to_release->exported);
+		release_gpio(gpio_to_release->gpio, gpio_to_release->gpio_name, gpio_to_release->input, gpio_to_release->exported);
 		to_free = gpio_to_release;
 		gpio_to_release = gpio_to_release->next;
 		free(to_free);
