@@ -317,6 +317,7 @@ static int gpio_sequence(struct port_interface *port, const char *seq, size_t le
 		free(to_free);
 	}
 #endif
+	usleep(100000);
 	fprintf(diag, "GPIO sequence end\n\n");
 	return ret;
 }
